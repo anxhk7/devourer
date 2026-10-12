@@ -1336,7 +1336,9 @@ bool UsbTransport::tx_async(uint8_t tx_ep, uint8_t *packet, size_t length,
    * indefinitely for transfer-end signaling and NAK every URB until libusb
    * cancels — matches the usbmon trace we captured: 6977 submitted URBs,
    * every completion with status=-2 (ENOENT/cancelled), data_len=0. */
-  transfer->flags |= LIBUSB_TRANSFER_ADD_ZERO_PACKET;
+  #ifndef _WIN32
+  	transfer->flags |= LIBUSB_TRANSFER_ADD_ZERO_PACKET;
+  #endif
   /* Count the submission here; async completion (incl. TIMED_OUT) is counted
    * in transfer_callback, a submit error just below. */
   _tx_submitted.fetch_add(1, std::memory_order_relaxed);

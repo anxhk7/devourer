@@ -46,7 +46,6 @@
 #include <mutex>
 #include <thread>
 #include <vector>
-#include <unistd.h>
 #include <libusb.h>
 #include "RadiotapBuilder.h"
 #include "RxPacket.h"
@@ -302,5 +301,5 @@ int main(int argc, char** argv) {
       fprintf(stderr, "WARNING: the beacon could not be stopped - it is still "
                       "airing; power-cycle the adapter\n");
   }
-  _exit(0);
+  std::_Exit(0);
 }
