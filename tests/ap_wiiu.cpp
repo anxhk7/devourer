@@ -6,8 +6,8 @@
 //   1. Identity = the real console. BSSID, PSK and SSID come from the Vanilla
 //      capture (secrets/vanilla-config.xml), NOT hardcoded. SSID is hidden in
 //      the beacon (16 zero bytes, matching the console) and answered in full to
-//      the GamePad's directed probe. Channel is 5 GHz (set DEVOURER_CHANNEL to
-//      the console's CURRENT channel — it is re-picked at each console boot).
+//      the GamePad's directed probe. The GamePad scans 5 GHz channels; channel
+//      161 was validated with the real console switched off.
 //
 //   2. The PSK is 64 hex chars = the raw 256-bit PMK. It is decoded straight to
 //      the PMK; PBKDF2 is NOT run (that is only for ASCII passphrases). This is
@@ -15,22 +15,17 @@
 //
 //   3. THE Wii U QUIRK: the PTK is rotated left by 3 bytes (first 3 bytes moved
 //      to the end). Standard WPA2 up to PTK derivation, then the rotation.
-//      WHERE it applies is the one unknown (your PROJECT_STATUS calls this the
-//      likely stuck point), so it is one env var, DEVOURER_WIIU_ROT:
+//      Full-PTK rotation is confirmed by the real GamePad handshake and data,
+//      and by Vanilla's drc-hostap wpa_pmk_to_ptk patch. DEVOURER_WIIU_ROT:
 //        ptk3 (default) — rotate the whole 48-byte PTK, so KCK (EAPOL MIC),
 //                         KEK (msg3 key wrap) AND TK (CCMP) all shift. Correct
-//                         IF the GamePad rotates before carving KCK/KEK/TK.
+//                         on the tested GamePad (use this).
 //        tk3            — standard handshake keys, rotate ONLY the 16-byte CCMP
 //                         TK. Correct IF the GamePad's EAPOL MICs are standard
 //                         and only the data-plane key is mangled.
 //        off            — no rotation (plain WPA2; sanity/control).
-//      DECISION TREE on first connect, from the log:
-//        * "msg2 MIC FAIL" under ptk3  -> the handshake keys are standard;
-//          switch to tk3.
-//        * "msg2 OK ... 4-WAY COMPLETE" then a decrypted GamePad frame
-//          ("DECRYPT OK") -> ptk3 is right, done.
-//        * "4-WAY COMPLETE" but every GamePad data frame fails to decrypt ->
-//          handshake keys standard but TK wrong; try tk3.
+//      A failed MIC alone does not identify the cause: also check the current
+//      session, declared EAPOL length, QoS AAD/nonce, and trailing adapter FCS.
 //
 //   4. Nintendo cipher-suite OUI a4:c0:e1 in the RSN IE (vs standard 00:0f:ac),
 //      in BOTH the beacon/probe/assoc AND msg3 key data. DEVOURER_WIIU_STD_OUI=1
@@ -43,16 +38,21 @@
 //      capability field of the console's beacon) into secrets/wiiu-ie-tail.hex
 //      (hex, whitespace ok) and it is used verbatim for the beacon.
 //
-// Build (add the CMake target below, then):
-//   cmake --build build --target ap_wiiu
+// DHCP/ARP run in-process; HID reports feed a loopback DSU endpoint for Cemu.
+// Video/audio and calibrated motion are not implemented. See docs/wiiu-gamepad.md.
+// Build:
+//   cmake --build build --config Release --target ap_wiiu
 // Run (Developer PowerShell, VM powered off so the Alfa is free):
 //   $env:DEVOURER_VID="0x0bda"; $env:DEVOURER_PID="0x8812"
-//   $env:DEVOURER_CHANNEL="161"        # <-- re-check the console's channel first
+//   $env:DEVOURER_CHANNEL="161"
 //   $env:DEVOURER_TX_WITH_RX="thread"; $env:DEVOURER_BCN_TU="25"
-//   build\ap_wiiu.exe 120
+//   build\Release\ap_wiiu.exe 120
+// Passive scan: build\Release\ap_wiiu.exe --scan 30
+#include "wiiu_dsu.h"
 #include <atomic>
 #include <array>
 #include <chrono>
+#include <csignal>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
@@ -77,6 +77,11 @@
 #include "WiFiDriver.h"
 #include "env_config.h"
 #include "logger.h"
+#include "sta/Ccmp.h"
+#include "ccmp_software.h"
+#include "ccmp_kernel_vectors.h"
+#include "openssl_crypto_ops.h"
+#include "wiiu_network.h"
 
 // ---- identity (filled from secrets/vanilla-config.xml at startup) ----------
 static uint8_t g_bssid[6];
@@ -88,6 +93,9 @@ enum RotMode { ROT_OFF, ROT_TK3, ROT_PTK3 };
 static RotMode g_rot = ROT_PTK3;
 static bool g_std_oui = false;          // true -> standard 00:0f:ac instead of Nintendo
 static std::vector<uint8_t> g_ie_override;  // exact captured IE tail for the beacon, if provided
+static bool g_scan = false;
+static std::atomic<unsigned> g_probe_count{0};
+static volatile std::sig_atomic_t g_stop = 0;
 
 static IRadio* g_dev = nullptr;
 static std::vector<uint8_t> g_rt;
@@ -155,7 +163,7 @@ static void emit_htcap(std::vector<uint8_t>& m) {
 // HT Operation (tag 0x3d, len 22). Primary channel = g_chan; 20 MHz. Capture
 // was 3d 16 9d 08 (9d = 157 primary). Basic MCS set left zero.
 static void emit_htop(std::vector<uint8_t>& m) {
-  m.insert(m.end(), {0x3d, 0x16, g_chan, 0x08, 0x00, 0x00, 0x00});
+  m.insert(m.end(), {0x3d, 0x16, g_chan, 0x08, 0x00, 0x00, 0x00, 0x00});
   for (int i = 0; i < 16; ++i) m.push_back(0x00);   // basic MCS set
 }
 static void emit_vendors(std::vector<uint8_t>& m) {
@@ -194,6 +202,10 @@ static uint8_t g_replay[8];
 static uint8_t g_sta[6];
 static int g_state = 0;  // 0 idle, 1 sent msg1, 2 keyed
 static std::atomic<uint64_t> g_decok{0}, g_decfail{0};
+static devourer::test::OpenSslCryptoOps g_crypto;
+static wiiu::Network g_network;
+static wiiu::DsuEndpoint g_dsu;
+static uint64_t g_txpn = 1;
 
 // ---- WPA2 crypto (openssl) -------------------------------------------------
 static void prf(const uint8_t* key, int klen, const char* label,
@@ -275,6 +287,7 @@ static std::vector<uint8_t> eapol_frame(uint16_t keyinfo, const uint8_t* nonce,
   return m;
 }
 static void send_msg1() {
+  g_txpn = 1; // fresh ANonce derives a fresh key; never reset on msg4 retries
   RAND_bytes(g_anonce, 32);
   for (int i=7;i>=0;--i) if (++g_replay[i]) break;
   enqueue(eapol_frame(0x008a, g_anonce, nullptr, 0, false));
@@ -298,46 +311,67 @@ static void send_msg3() {
 }
 
 // ---- CCMP (software AES-CCM), TK = g_tk -------------------------------------
-static void ccmp_aad_nonce(const uint8_t* hdr, uint64_t pn, const uint8_t* a2,
-                           uint8_t* aad, int* aadlen, uint8_t* nonce) {
-  uint16_t fc = hdr[0] | (hdr[1] << 8);
-  fc &= ~0x0070; fc &= ~(0x0800|0x1000|0x2000); fc |= 0x4000;
-  aad[0]=fc&0xff; aad[1]=fc>>8;
-  memcpy(aad+2, hdr+4, 18);
-  uint16_t seq = (hdr[22]|(hdr[23]<<8)) & 0x000f;
-  aad[20]=seq&0xff; aad[21]=seq>>8; *aadlen=22;
-  nonce[0]=0; memcpy(nonce+1, a2, 6);
-  for (int i=0;i<6;i++) nonce[7+i] = (pn >> (8*(5-i))) & 0xff;
-}
 static bool ccm(bool enc, const uint8_t* key, const uint8_t* nonce, const uint8_t* aad,
                 int aadlen, const uint8_t* in, int inlen, uint8_t* out, uint8_t* tag) {
-  EVP_CIPHER_CTX* c = EVP_CIPHER_CTX_new(); int l; bool ok=true;
-  if (enc) {
-    EVP_EncryptInit_ex(c, EVP_aes_128_ccm(), 0,0,0);
-    EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_SET_IVLEN, 13, 0);
-    EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_SET_TAG, 8, 0);
-    EVP_EncryptInit_ex(c, 0,0,key,nonce);
-    EVP_EncryptUpdate(c, 0,&l,0,inlen); EVP_EncryptUpdate(c,0,&l,aad,aadlen);
-    EVP_EncryptUpdate(c, out,&l,in,inlen); EVP_EncryptFinal_ex(c,out+l,&l);
-    EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_GET_TAG, 8, tag);
-  } else {
-    EVP_DecryptInit_ex(c, EVP_aes_128_ccm(), 0,0,0);
-    EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_SET_IVLEN, 13, 0);
-    EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_SET_TAG, 8, tag);
-    EVP_DecryptInit_ex(c, 0,0,key,nonce);
-    EVP_DecryptUpdate(c, 0,&l,0,inlen); EVP_DecryptUpdate(c,0,&l,aad,aadlen);
-    ok = EVP_DecryptUpdate(c, out,&l,in,inlen) > 0;
-  }
-  EVP_CIPHER_CTX_free(c); return ok;
+  return devourer::test::ccmp_software(enc, key, nonce, aad, aadlen,
+                                      in, inlen, out, tag);
 }
 
-static void on_rx(const Packet& p) {
+static void send_plain(uint16_t eth, const std::vector<uint8_t>& payload) {
+  std::vector<uint8_t> plain = {0xaa,0xaa,3,0,0,0,uint8_t(eth >> 8),uint8_t(eth)};
+  plain.insert(plain.end(), payload.begin(), payload.end());
+  auto hdr = mgmt_hdr(0x08, g_sta); hdr[1] = 0x42;
+  std::vector<uint8_t> frame(devourer::sta::ccmp_encrypted_len(hdr.size(), plain.size()));
+  if (devourer::sta::ccmp_encrypt(g_crypto, g_tk, hdr.data(), hdr.size(), g_bssid,
+                                 g_txpn++, 0, plain.data(), plain.size(),
+                                 frame.data(), frame.size()))
+    enqueue(std::move(frame));
+}
+
+static void handle_plain(const std::vector<uint8_t>& plain) {
+  auto offers = g_network.offers, acks = g_network.acks, arps = g_network.arps;
+  g_network.receive(g_bssid, g_sta, plain.data(), plain.size(), send_plain,
+    [](uint16_t sport, uint16_t dport, const uint8_t* hid, size_t n) {
+      if (sport == 50122 && dport == 50022) g_dsu.update(hid, n, g_sta);
+      if (g_network.udp_packets <= 16)
+        fprintf(stderr, "  GamePad UDP %u -> %u, %zu bytes\n", sport, dport, n);
+    });
+  if (g_network.offers != offers) fprintf(stderr, "  DHCP OFFER: 192.168.1.11\n");
+  if (g_network.acks != acks) fprintf(stderr, "  DHCP ACK: GamePad leased 192.168.1.11\n");
+  if (g_network.arps != arps) fprintf(stderr, "  ARP reply: console is 192.168.1.10\n");
+}
+
+static void on_rx(const Packet& raw) {
+  Packet p = raw;
+  if (p.RxAtrib.fcs_present) {
+    if (p.Data.size() < 4) return;
+    p.Data = p.Data.first(p.Data.size() - 4);
+  }
   if (p.Data.size() < 24 || p.RxAtrib.crc_err) return;
   const uint8_t fc0 = p.Data[0], fc1 = p.Data[1];
   const uint8_t* a1 = p.Data.data() + 4;
   const uint8_t* sta = p.Data.data() + 10;
   bool to_us = std::memcmp(a1, g_bssid, 6) == 0;
   bool bcast = (a1[0] & 0x01) != 0;
+
+  if (g_scan) {
+    if (fc0 != 0x40) return;
+    size_t off = 24;
+    while (off + 2 <= p.Data.size()) {
+      const size_t n = p.Data[off + 1];
+      if (off + 2 + n > p.Data.size()) break;
+      if (p.Data[off] == 0 && n == g_ssid.size() &&
+          memcmp(p.Data.data() + off + 2, g_ssid.data(), n) == 0) {
+        g_probe_count.fetch_add(1);
+        fprintf(stderr, "SCAN: GamePad probe on ch%u from "
+                        "%02x:%02x:%02x:%02x:%02x:%02x for '%s'\n",
+                g_dev->GetSelectedChannel().Channel,
+                sta[0],sta[1],sta[2],sta[3],sta[4],sta[5],g_ssid.c_str());
+      }
+      off += 2 + n;
+    }
+    return;
+  }
 
   if (fc0 == 0x40) {                                   // probe-req
     if (!bcast && !to_us) return;
@@ -354,27 +388,31 @@ static void on_rx(const Packet& p) {
     fprintf(stderr, "  AUTH from %02x:%02x:%02x:%02x:%02x:%02x\n",
             sta[0],sta[1],sta[2],sta[3],sta[4],sta[5]);
   } else if ((fc0 == 0x00 || fc0 == 0x20) && to_us) {  // (re)assoc
-    auto m = mgmt_hdr(0x10, sta);
+    auto m = mgmt_hdr(fc0 == 0x20 ? 0x30 : 0x10, sta);
     m.insert(m.end(), {0x11,0x00, 0x00,0x00, 0x01,0xc0});   // cap, status 0, AID 1
     emit_rates(m); emit_htcap(m); emit_htop(m);
+    { auto r = rsn_ie(); m.insert(m.end(), r.begin(), r.end()); }
+    emit_vendors(m);
     enqueue(std::move(m));
     memcpy(g_sta, sta, 6); memset(g_replay, 0, 8); g_state = 0;
     fprintf(stderr, "  ASSOC from %02x:%02x:%02x:%02x:%02x:%02x -> start 4-way\n",
             sta[0],sta[1],sta[2],sta[3],sta[4],sta[5]);
     send_msg1();
   } else if ((fc0 == 0x08 || fc0 == 0x88) && (fc1 & 0x01) && to_us) {  // data to-DS
-    int hlen = 24 + (fc0 == 0x88 ? 2 : 0);
+    if ((fc1 & 0x03) != 0x01 || memcmp(sta, g_sta, 6) != 0) return;
+    int hlen = (int)devourer::sta::data_hdr_len(fc0, fc1);
     if ((fc1 & 0x40) && g_state == 2) {                // PROTECTED (CCMP) data
       int len = (int)p.Data.size();
       if (len < hlen + 8 + 8) return;
       const uint8_t* d = p.Data.data();
       const uint8_t* cc = d + hlen;
-      uint64_t pn = cc[0] | (cc[1]<<8) | ((uint64_t)cc[4]<<16) | ((uint64_t)cc[5]<<24)
-                  | ((uint64_t)cc[6]<<32) | ((uint64_t)cc[7]<<40);
+      if (!(cc[3] & 0x20) || devourer::sta::ccmp_key_id(cc) != 0) return;
+      uint64_t pn = devourer::sta::ccmp_header_pn(cc);
       int ctlen = len - hlen - 8 - 8;
       const uint8_t* ct = d + hlen + 8; const uint8_t* mic = ct + ctlen;
       uint8_t aad[32], nonce[13], tag[8]; int aadlen;
-      ccmp_aad_nonce(d, pn, sta, aad, &aadlen, nonce);
+      aadlen = (int)devourer::sta::ccmp_aad(d, hlen, aad);
+      if (!aadlen || !devourer::sta::ccmp_nonce(d, hlen, sta, pn, nonce)) return;
       memcpy(tag, mic, 8);
       std::vector<uint8_t> pt(ctlen);
       if (ccm(false, g_tk, nonce, aad, aadlen, ct, ctlen, pt.data(), tag)) {
@@ -386,10 +424,11 @@ static void on_rx(const Packet& p) {
                   g_rot==ROT_PTK3?"ptk3":g_rot==ROT_TK3?"tk3":"off", eth, ctlen,
                   ctlen>0?pt[0]:0, ctlen>1?pt[1]:0, ctlen>2?pt[2]:0, ctlen>3?pt[3]:0);
         }
+        handle_plain(pt);
       } else {
         uint64_t n = g_decfail.fetch_add(1);
         if (n < 4)
-          fprintf(stderr, "  decrypt FAIL (rotation '%s' wrong for the TK?) pn=%llu\n",
+          fprintf(stderr, "  decrypt FAIL (CCMP MIC; check session, framing or TK, rot='%s') pn=%llu\n",
                   g_rot==ROT_PTK3?"ptk3":g_rot==ROT_TK3?"tk3":"off",
                   (unsigned long long)pn);
       }
@@ -400,14 +439,17 @@ static void on_rx(const Packet& p) {
     if (!(llc[0]==0xaa && llc[6]==0x88 && llc[7]==0x8e)) return;  // EAPOL only
     const uint8_t* e = llc + 8; int elen = (int)p.Data.size() - (hlen + 8);
     if (elen < 99 || e[1] != 3) return;
+    const int declared_len = 4 + ((e[2] << 8) | e[3]);
+    if (declared_len < 99 || declared_len > elen ||
+        99 + ((e[97] << 8) | e[98]) != declared_len) return;
+    elen = declared_len;  // trailing 802.11 padding is not part of the MIC
     uint16_t ki = (e[5]<<8) | e[6];
     if ((ki & 0x0008) && (ki & 0x0100) && !(ki & 0x0040) && !(ki & 0x0200)) {   // msg2
       memcpy(g_snonce, e+17, 32);
       compute_ptk();
       if (!check_mic(e, elen)) {
-        fprintf(stderr, "  WPA2: msg2 MIC FAIL (rotation '%s' — if this is ptk3, "
-                        "the handshake keys are standard: retry with "
-                        "DEVOURER_WIIU_ROT=tk3)\n",
+        fprintf(stderr, "  WPA2: msg2 MIC FAIL (rotation '%s'; check credentials, "
+                        "session and EAPOL framing before changing rotation)\n",
                 g_rot==ROT_PTK3?"ptk3":g_rot==ROT_TK3?"tk3":"off");
         return;
       }
@@ -421,6 +463,132 @@ static void on_rx(const Packet& p) {
       }
     }
   }
+}
+
+// Verify the actual receive path against frames encrypted by Linux, including
+// every QoS TID. A local encrypt/decrypt round trip would miss shared errors.
+static int self_test() {
+  int failures = 0;
+  auto require = [&](bool ok, const char* name) {
+    if (!ok) { fprintf(stderr, "FAIL: %s\n", name); ++failures; }
+  };
+  memcpy(g_tk, devourer::test::kKernelTk, 16);
+  g_state = 2;
+  for (const auto& v : devourer::test::kKernelCcmpVectors) {
+    const auto* d = v.mpdu;
+    const int n = (int)(v.mpdu_len - v.hdr_len - 16);
+    uint8_t aad[32], nonce[13], tag[8];
+    int alen = (int)devourer::sta::ccmp_aad(d, v.hdr_len, aad);
+    const uint64_t pn = devourer::sta::ccmp_header_pn(d + v.hdr_len);
+    require(devourer::sta::ccmp_nonce(d, v.hdr_len, d + 10, pn, nonce), v.name);
+    memcpy(tag, d + v.mpdu_len - 8, 8);
+    std::vector<uint8_t> plain(n);
+    require(ccm(false, g_tk, nonce, aad, alen, d + v.hdr_len + 8,
+                n, plain.data(), tag), v.name);
+    tag[0] ^= 1;
+    require(!ccm(false, g_tk, nonce, aad, alen, d + v.hdr_len + 8,
+                 n, plain.data(), tag), "corrupt CCMP MIC rejected");
+    if ((d[1] & 3) == 1) {
+      memcpy(g_bssid, d + 4, 6); memcpy(g_sta, d + 10, 6);
+      std::vector<uint8_t> frame(d, d + v.mpdu_len);
+      Packet p{};
+      p.RxAtrib.fcs_present = false;
+      p.Data = frame;
+      auto before = g_decok.load();
+      on_rx(p);
+      require(g_decok.load() == before + 1, v.name);
+      frame.insert(frame.end(), {0x12, 0x34, 0x56, 0x78});
+      p.Data = frame;
+      p.RxAtrib.fcs_present = true;
+      before = g_decok.load();
+      on_rx(p);
+      require(g_decok.load() == before + 1, "receive path strips adapter FCS");
+      frame.resize(frame.size() - 4);
+      p.Data = frame;
+      p.RxAtrib.fcs_present = false;
+      p.Data.back() ^= 1;
+      before = g_decfail.load();
+      on_rx(p);
+      require(g_decfail.load() == before + 1, "receive path rejects corrupt MIC");
+      p.Data = p.Data.first(24);
+      before = g_decok.load();
+      on_rx(p);
+      require(g_decok.load() == before, "truncated QoS frame ignored");
+    }
+  }
+  std::vector<uint8_t> ies;
+  g_ssid = "WiiU001122334455";
+  emit_ssid(ies, true); emit_rates(ies); emit_tim(ies);
+  auto rsn = rsn_ie(); ies.insert(ies.end(), rsn.begin(), rsn.end());
+  emit_htcap(ies); emit_htop(ies); emit_vendors(ies);
+  size_t pos = 0;
+  while (pos + 2 <= ies.size() && pos + 2 + ies[pos + 1] <= ies.size())
+    pos += 2 + ies[pos + 1];
+  require(pos == ies.size(), "beacon IE lengths consume the exact tail");
+  require(wiiu::crc32(reinterpret_cast<const uint8_t*>("123456789"), 9) == 0xcbf43926,
+          "DSU CRC32 independent known answer");
+  std::array<uint8_t,128> hid{};
+  for (int i = 0; i < 4; ++i) wiiu::put_le(hid.data() + 6 + 2*i, 2050, 2);
+  hid[2] = 0x80; // GamePad A -> DSU Circle
+  auto dsu = wiiu::dsu_packet(0x100002, 100);
+  wiiu::encode_dsu_input(dsu, hid.data());
+  require(dsu[37] == 32 && dsu[50] == 255 && dsu[40] == 128 && dsu[41] == 128,
+          "DSU A button and neutral sticks");
+  wiiu::put_le(hid.data() + 6, 3200, 2);
+  wiiu::put_le(hid.data() + 8, 900, 2);
+  dsu = wiiu::dsu_packet(0x100002, 100); wiiu::encode_dsu_input(dsu, hid.data());
+  require(dsu[40] == 255 && dsu[41] == 1, "DSU stick limits");
+  for (int i = 0; i < 10; ++i) {
+    wiiu::put_le(hid.data() + 36 + 4*i, 195, 2);
+    wiiu::put_le(hid.data() + 38 + 4*i, 3818, 2);
+  }
+  hid[37] |= 0x10;
+  dsu = wiiu::dsu_packet(0x100002, 100); wiiu::encode_dsu_input(dsu, hid.data());
+  require(dsu[39] == 1 && dsu[56] == 1 && dsu[58] == 45 && dsu[60] == 39,
+          "DSU touch calibration and contact");
+  wiiu::Network net;
+  const uint8_t ap[6] = {2,0,0,0,0,1}, sta[6] = {2,0,0,0,0,2};
+  std::vector<uint8_t> request(8 + 28 + 244, 0);
+  memcpy(request.data(), "\xaa\xaa\x03\x00\x00\x00\x08\x00", 8);
+  auto* ip = request.data() + 8;
+  ip[0] = 0x45; ip[8] = 64; ip[9] = 17;
+  wiiu::put16(ip + 2, uint16_t(request.size() - 8));
+  memset(ip + 16, 255, 4);
+  wiiu::put16(ip + 10, wiiu::checksum(ip, 20));
+  wiiu::put16(ip + 20, 68); wiiu::put16(ip + 22, 67);
+  wiiu::put16(ip + 24, 8 + 244);
+  auto* dh = ip + 28;
+  dh[0] = 1; dh[1] = 1; dh[2] = 6;
+  dh[4] = 0x12; dh[5] = 0x34; dh[6] = 0x56; dh[7] = 0x78;
+  memcpy(dh + 28, sta, 6);
+  const uint8_t options[] = {99,130,83,99,53,1,1,255};
+  memcpy(dh + 236, options, sizeof options);
+  std::vector<uint8_t> reply;
+  auto sink = [&](uint16_t eth, const std::vector<uint8_t>& p) {
+    require(eth == 0x0800, "DHCP reply ethertype"); reply = p;
+  };
+  auto ignore_udp = [](uint16_t, uint16_t, const uint8_t*, size_t) {};
+  net.receive(ap, sta, request.data(), request.size(), sink, ignore_udp);
+  require(net.offers == 1 && reply.size() >= 271, "DHCP DISCOVER produces OFFER");
+  if (reply.size() >= 271) {
+    require(!wiiu::checksum(reply.data(), 20), "DHCP reply IPv4 checksum");
+    require(!memcmp(reply.data() + 28 + 4, dh + 4, 4), "DHCP transaction retained");
+    require(!memcmp(reply.data() + 28 + 16, wiiu::gamepad_ip, 4), "GamePad lease address");
+    require(reply[28 + 242] == 2, "DHCP OFFER message type");
+  }
+  dh[242] = 3;
+  net.receive(ap, sta, request.data(), request.size(), sink, ignore_udp);
+  require(net.acks == 1 && reply[28 + 242] == 5, "DHCP REQUEST produces ACK");
+  dh[241] = 255; // option length extends past datagram
+  net.receive(ap, sta, request.data(), request.size(), sink, ignore_udp);
+  require(net.acks == 1, "malformed DHCP options ignored");
+  request.resize(12);
+  net.receive(ap, sta, request.data(), request.size(), sink, ignore_udp);
+  require(net.acks == 1, "truncated IPv4 ignored");
+  fprintf(stderr, "ap_wiiu self-test: %zu kernel CCMP vectors, QoS receive path, "
+                  "FCS, corrupt/truncated frames, beacon IEs, DHCP, DSU: %s\n",
+          devourer::test::kKernelCcmpVectorCount, failures ? "FAIL" : "PASS");
+  return failures ? 1 : 0;
 }
 
 static bool load_identity() {
@@ -467,7 +635,12 @@ static bool load_identity() {
 }
 
 int main(int argc, char** argv) {
-  int sec = argc > 1 ? atoi(argv[1]) : 60;
+  if (argc > 1 && !strcmp(argv[1], "--self-test")) return self_test();
+  g_scan = argc > 1 && !strcmp(argv[1], "--scan");
+  int sec = g_scan ? (argc > 2 ? atoi(argv[2]) : 30) : (argc > 1 ? atoi(argv[1]) : 60);
+  if (sec < 1 || sec > 3600) { fprintf(stderr, "Duration must be 1..3600 seconds\n"); return 1; }
+  std::signal(SIGINT, [](int) { g_stop = 1; });
+  std::signal(SIGTERM, [](int) { g_stop = 1; });
   if (const char* c = std::getenv("DEVOURER_CHANNEL")) g_chan = (uint8_t)atoi(c);
   if (const char* r = std::getenv("DEVOURER_WIIU_ROT")) {
     if (!strcmp(r, "off")) g_rot = ROT_OFF;
@@ -482,9 +655,11 @@ int main(int argc, char** argv) {
       fprintf(stderr, "beacon IE tail: using %zu captured bytes from %s\n", g_ie_override.size(), h); }
   }
   if (!load_identity()) return 1;
+  if (!g_scan && !g_dsu.start()) {
+    fprintf(stderr, "ERROR: could not bind the local DSU endpoint on port 26760\n"); return 1;
+  }
   if (!std::getenv("DEVOURER_CHANNEL"))
-    fprintf(stderr, "WARNING: DEVOURER_CHANNEL unset, assuming %d — re-check the "
-                    "console's CURRENT channel first (it changes at boot)\n", g_chan);
+    fprintf(stderr, "DEVOURER_CHANNEL unset, using %d; GamePad scans for the AP\n", g_chan);
 
   fprintf(stderr, "Impersonating console %02x:%02x:%02x:%02x:%02x:%02x  SSID '%s'  ch%d  "
                   "rot=%s  oui=%s\n",
@@ -508,6 +683,22 @@ int main(int argc, char** argv) {
   g_rt = devourer::build_stream_radiotap(devourer::parse_tx_mode_str("6M"));
   g_dev->InitWrite(SelectedChannel{g_chan, 0, CHANNEL_WIDTH_20});
 
+  if (g_scan) {
+    std::thread rx([&]{ g_dev->StartRxLoop(on_rx); });
+    fprintf(stderr, "Passive GamePad scan for %ds; keep the GamePad trying to connect.\n", sec);
+    const uint8_t channels[] = {149,153,157,161,165,36,40,44,48};
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(sec);
+    size_t i = 0;
+    while (!g_stop && std::chrono::steady_clock::now() < end) {
+      g_dev->FastRetune(channels[i++ % (sizeof channels)], true);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    }
+    g_dev->StopRxLoop(); rx.join();
+    g_dev->Stop();
+    fprintf(stderr, "SCAN complete: %u matching GamePad probes.\n", g_probe_count.load());
+    std::_Exit(g_probe_count.load() ? 0 : 2);
+  }
+
   int tu = 100; if (const char* i = std::getenv("DEVOURER_BCN_TU")) tu = atoi(i);
   std::vector<uint8_t> bcn = {0,0,0x0a,0,0,0x80,0,0,0x08,0,       // radiotap
       0x80,0,0,0, 0xff,0xff,0xff,0xff,0xff,0xff,                  // beacon, bcast DA
@@ -528,12 +719,16 @@ int main(int argc, char** argv) {
           bok ? "OK" : "FAIL", tu, sec);
 
   auto end = std::chrono::steady_clock::now() + std::chrono::seconds(sec);
-  while (std::chrono::steady_clock::now() < end) {
+  while (!g_stop && std::chrono::steady_clock::now() < end) {
+    g_dsu.pump();
     std::vector<std::vector<uint8_t>> batch;
     { std::lock_guard<std::mutex> l(g_q_mu); batch.swap(g_q); }
     for (auto& f : batch) if (g_dev->send_packet(f.data(), f.size())) g_sent.fetch_add(1);
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
+  g_dev->StopRxLoop(); rx.join();
+  fprintf(stderr, "network: offers=%u acks=%u arps=%u udp=%u\n",
+          g_network.offers, g_network.acks, g_network.arps, g_network.udp_packets);
   fprintf(stderr, "sent=%llu 4way_state=%d decrypt_ok=%llu decrypt_fail=%llu\n",
           (unsigned long long)g_sent.load(), g_state,
           (unsigned long long)g_decok.load(), (unsigned long long)g_decfail.load());
@@ -544,5 +739,7 @@ int main(int argc, char** argv) {
       fprintf(stderr, "WARNING: the beacon could not be stopped - it is still "
                       "airing; power-cycle the adapter\n");
   }
-  _exit(0);
+  g_dev->Stop();
+  g_dsu.stop();
+  std::_Exit(0);
 }

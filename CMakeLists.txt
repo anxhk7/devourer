@@ -1037,6 +1037,18 @@ option(DEVOURER_REQUIRE_STA_CRYPTO_TESTS
        OFF)
 find_package(OpenSSL QUIET)
 if(OpenSSL_FOUND)
+    add_executable(ap_wiiu tests/ap_wiiu.cpp examples/common/env_config.cpp)
+    target_link_libraries(ap_wiiu PUBLIC devourer
+        PRIVATE PkgConfig::libusb OpenSSL::Crypto Threads::Threads)
+    target_include_directories(ap_wiiu PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
+    target_compile_features(ap_wiiu PRIVATE cxx_std_20)
+    if(WIN32)
+        target_link_libraries(ap_wiiu PRIVATE ws2_32)
+    endif()
+    add_test(NAME ap_wiiu_headless COMMAND ap_wiiu --self-test)
+
     # src/sta/Eapol.h and src/sta/Supplicant.h - the station half of the
     # WPA2-PSK key exchange.
     #
@@ -1814,6 +1826,9 @@ endif()
 # "Selftest" — so a newly-added selftest is picked up automatically and can never
 # be silently skipped. Must sit AFTER all *Selftest targets are defined.
 add_custom_target(selftests)
+if(TARGET ap_wiiu)
+    add_dependencies(selftests ap_wiiu)
+endif()
 get_directory_property(_dvr_targets BUILDSYSTEM_TARGETS)
 foreach(_dvr_t IN LISTS _dvr_targets)
     if(_dvr_t MATCHES "Selftest$")
