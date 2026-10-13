@@ -1037,17 +1037,28 @@ option(DEVOURER_REQUIRE_STA_CRYPTO_TESTS
        OFF)
 find_package(OpenSSL QUIET)
 if(OpenSSL_FOUND)
-    add_executable(ap_wiiu tests/ap_wiiu.cpp examples/common/env_config.cpp)
-    target_link_libraries(ap_wiiu PUBLIC devourer
-        PRIVATE PkgConfig::libusb OpenSSL::Crypto Threads::Threads)
-    target_include_directories(ap_wiiu PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
-    target_compile_features(ap_wiiu PRIVATE cxx_std_20)
-    if(WIN32)
-        target_link_libraries(ap_wiiu PRIVATE ws2_32)
-    endif()
+    # A second output permits video development while the input bridge is running
+    # on Windows (its executable is locked until the current session ends).
+    foreach(wiiu_target ap_wiiu ap_wiiu_video)
+        add_executable(${wiiu_target} tests/ap_wiiu.cpp examples/common/env_config.cpp)
+        target_link_libraries(${wiiu_target} PUBLIC devourer
+            PRIVATE PkgConfig::libusb OpenSSL::Crypto Threads::Threads)
+        target_include_directories(${wiiu_target} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/examples/common)
+        target_compile_features(${wiiu_target} PRIVATE cxx_std_20)
+        if(WIN32)
+            target_link_libraries(${wiiu_target} PRIVATE ws2_32 winmm)
+        endif()
+    endforeach()
     add_test(NAME ap_wiiu_headless COMMAND ap_wiiu --self-test)
+
+    add_executable(WiiuStreamSelftest tests/wiiu_stream_selftest.cpp)
+    target_compile_features(WiiuStreamSelftest PRIVATE cxx_std_20)
+    if(WIN32)
+        target_link_libraries(WiiuStreamSelftest PRIVATE ws2_32)
+    endif()
+    add_test(NAME wiiu_stream COMMAND WiiuStreamSelftest)
 
     # src/sta/Eapol.h and src/sta/Supplicant.h - the station half of the
     # WPA2-PSK key exchange.

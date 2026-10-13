@@ -33,10 +33,10 @@ std::vector<uint8_t> build_stream_radiotap(const TxMode& mode);
  * to a peer that ACKs wants no_ack=false, or the transmitter never retries:
  * on the MT7612U NOACK clears the TXWI ACK request and its hardware
  * retry is never used. Group-addressed frames must keep NOACK.
- * Only the MT7612U reads this bit. The Realtek backends ignore radiotap
- * TX_FLAGS and keep their existing ACK behaviour whatever no_ack says:
- * Jaguar1 always marks the descriptor BMC; Jaguar2/3, Kestrel and the
- * RTL8733B set BMC from addr1's group bit. mode.no_agg rides the same field
+ * MT7612U and Jaguar1 read this bit. Jaguar1 preserves its no-ACK default
+ * when TX_FLAGS is absent, and always disables ACK for group receivers.
+ * Jaguar2/3, Kestrel and RTL8733B ignore NOACK and set BMC from addr1's
+ * group bit. mode.no_agg rides the same field
  * as a separate, devourer-private bit (RadiotapTxFlags.h), independent of
  * no_ack. */
 std::vector<uint8_t> build_stream_radiotap(const TxMode& mode, bool no_ack);

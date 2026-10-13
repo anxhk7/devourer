@@ -754,3 +754,10 @@ bias and is not a validated degradation predictor. One bench, one part, and a
 USB3 host would divide it; the shape of the result is the transferable part.
 Sensor reads belong on the caller's own cadence via the runtime getters, never
 inside `send_packet`.
+
+## Physical Wii U GamePad / Cemu continuation
+
+Read `docs/wiiu-handoff-2026-10-12.md` for the latest stopping point and
+`docs/wiiu-gamepad.md` for build/run instructions. Input works in-game; video
+has reached the physical screen but remains unstable. The final ACK/retry
+experiment failed physically and is opt-in; do not assume it fixed delivery.

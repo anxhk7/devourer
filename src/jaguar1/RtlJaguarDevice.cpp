@@ -11,6 +11,7 @@
 #include "AckResponder.h" /* hardware ACK responder recipe */
 #include "RadiotapPeek.h" /* send_packets batch pre-parse */
 #include "RadiotapTxFlags.h" /* shared HT MCS known/flag decode (LDPC/STBC) */
+#include "TxAckPolicy.h"
 #include "SignalStop.h"
 #include "ToneMask.h"
 #include "TxAggPlan.h" /* USB TX aggregation URB packing */
@@ -1293,6 +1294,7 @@ size_t RtlJaguarDevice::build_tx_block(const uint8_t *packet, size_t length,
   int qos_len = 0;
   u8 fixed_rate = MGN_1M, sgi = 0, bwidth = 0, ldpc = 0, stbc = 0;
   u16 txflags = 0;
+  bool has_tx_flags = false;
   int rate_id = 0;
   /* True once the radiotap carries a rate (RATE / HT-MCS-index / VHT). When it
    * stays false the device TX-mode default (SetTxMode) — else MGN_1M — applies. */
@@ -1343,6 +1345,7 @@ size_t RtlJaguarDevice::build_tx_block(const uint8_t *packet, size_t length,
 
     case IEEE80211_RADIOTAP_TX_FLAGS:
       txflags = get_unaligned_le16(iterator.this_arg);
+      has_tx_flags = true;
       break;
 
     case IEEE80211_RADIOTAP_CHANNEL:
@@ -1547,7 +1550,8 @@ size_t RtlJaguarDevice::build_tx_block(const uint8_t *packet, size_t length,
     rate_id = 9;
   }
 
-  SET_TX_DESC_BMC_8812(usb_frame, 1);
+  SET_TX_DESC_BMC_8812(usb_frame, devourer::jaguar1_tx_no_ack(
+      has_tx_flags, txflags, packet + radiotap_length, real_packet_length));
   SET_TX_DESC_RATE_ID_8812(usb_frame, static_cast<uint8_t>(rate_id));
 
   SET_TX_DESC_QUEUE_SEL_8812(usb_frame, 0x12);

@@ -18,6 +18,7 @@
 #include "RadiotapBuilder.h"
 #include "RadiotapPeek.h"
 #include "ieee80211_radiotap.h"
+#include "jaguar1/TxAckPolicy.h"
 
 static int g_fail = 0;
 static void expect(const char *what, bool ok) {
@@ -67,7 +68,20 @@ int main() {
       }
     std::snprintf(what, sizeof what, "%s: no_ack=false changes only the NOACK bit", spec);
     expect(what, only_flag && diff_bytes == 1);
+    uint8_t frame[24] = {0x08, 0x02, 0, 0, 0x40, 0xd2, 0x8a, 0x11, 0x36, 0x31};
+    std::snprintf(what, sizeof what, "%s: Jaguar1 explicit unicast requests ACK", spec);
+    expect(what, !devourer::jaguar1_tx_no_ack(fa >= 0, uint16_t(fa), frame, sizeof frame));
+    std::snprintf(what, sizeof what, "%s: Jaguar1 default unicast keeps NOACK", spec);
+    expect(what, devourer::jaguar1_tx_no_ack(fd >= 0, uint16_t(fd), frame, sizeof frame));
+    frame[4] |= 1;
+    std::snprintf(what, sizeof what, "%s: Jaguar1 group receiver cannot request ACK", spec);
+    expect(what, devourer::jaguar1_tx_no_ack(fa >= 0, uint16_t(fa), frame, sizeof frame));
   }
+  uint8_t unicast[10] = {0x08, 0x02, 0, 0, 0x40};
+  expect("Jaguar1 absent TX_FLAGS preserves legacy NOACK",
+         devourer::jaguar1_tx_no_ack(false, 0, unicast, sizeof unicast));
+  expect("Jaguar1 truncated receiver cannot request ACK",
+         devourer::jaguar1_tx_no_ack(true, 0, unicast, sizeof unicast - 1));
   if (g_fail) {
     std::printf("%d check(s) failed\n", g_fail);
     return 1;

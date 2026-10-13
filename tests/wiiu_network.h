@@ -102,7 +102,9 @@ struct Network {
       if (!reply_type) return;
       if (reply_type == 2) ++offers; else ++acks;
       send(0x0800, dhcp_reply(sta_mac, body, reply_type));
-    } else if (!memcmp(p + 16, console_ip, 4) && !memcmp(p + 12, gamepad_ip, 4)) {
+    } else if ((!memcmp(p + 16, console_ip, 4) ||
+               (dport == 50010 && p[16] == 255 && p[17] == 255 && p[18] == 255 && p[19] == 255)) &&
+               !memcmp(p + 12, gamepad_ip, 4)) {
       ++udp_packets; udp_cb(sport, dport, body, blen);
     }
   }

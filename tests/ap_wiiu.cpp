@@ -49,6 +49,10 @@
 //   build\Release\ap_wiiu.exe 120
 // Passive scan: build\Release\ap_wiiu.exe --scan 30
 #include "wiiu_dsu.h"
+#include "wiiu_stream.h"
+#ifdef _WIN32
+#include <mmsystem.h>
+#endif
 #include <atomic>
 #include <array>
 #include <chrono>
@@ -99,9 +103,15 @@ static volatile std::sig_atomic_t g_stop = 0;
 
 static IRadio* g_dev = nullptr;
 static std::vector<uint8_t> g_rt;
+static std::vector<uint8_t> g_data_rt;
 static std::atomic<uint64_t> g_sent{0};
 static std::mutex g_q_mu;
-static std::vector<std::vector<uint8_t>> g_q;
+static std::recursive_mutex g_session_mu;
+static uint32_t g_epoch = 0;
+static bool g_enable_video = false, g_hid_seen = false;
+struct PendingFrame { std::vector<uint8_t> bytes; uint32_t epoch; bool encrypted; };
+static std::vector<PendingFrame> g_q;
+static std::atomic<uint64_t> g_queue_drops{0};
 
 // ---- hex helpers -----------------------------------------------------------
 static int hexval(int c) {
@@ -183,12 +193,14 @@ static void emit_ssid(std::vector<uint8_t>& m, bool hidden) {
     m.insert(m.end(), g_ssid.begin(), g_ssid.end()); }
 }
 
-static void enqueue(std::vector<uint8_t> mpdu) {
-  std::vector<uint8_t> f; f.reserve(g_rt.size() + mpdu.size());
-  f.insert(f.end(), g_rt.begin(), g_rt.end());
+static void enqueue(std::vector<uint8_t> mpdu, bool encrypted = false) {
+  const auto& rt = encrypted && !g_data_rt.empty() ? g_data_rt : g_rt;
+  std::vector<uint8_t> f; f.reserve(rt.size() + mpdu.size());
+  f.insert(f.end(), rt.begin(), rt.end());
   f.insert(f.end(), mpdu.begin(), mpdu.end());
   std::lock_guard<std::mutex> lk(g_q_mu);
-  if (g_q.size() < 128) g_q.push_back(std::move(f));
+  if (g_q.size() < 2048) g_q.push_back({std::move(f), g_epoch, encrypted});
+  else g_queue_drops.fetch_add(1);
 }
 static std::vector<uint8_t> mgmt_hdr(uint8_t fc, const uint8_t* sta) {
   return {fc, 0, 0, 0, sta[0],sta[1],sta[2],sta[3],sta[4],sta[5],
@@ -205,7 +217,10 @@ static std::atomic<uint64_t> g_decok{0}, g_decfail{0};
 static devourer::test::OpenSslCryptoOps g_crypto;
 static wiiu::Network g_network;
 static wiiu::DsuEndpoint g_dsu;
+static wiiu::DrcStream g_stream;
+static wiiu::VideoIngress g_video_ingress;
 static uint64_t g_txpn = 1;
+static uint16_t g_data_seq = 0;
 
 // ---- WPA2 crypto (openssl) -------------------------------------------------
 static void prf(const uint8_t* key, int klen, const char* label,
@@ -287,6 +302,7 @@ static std::vector<uint8_t> eapol_frame(uint16_t keyinfo, const uint8_t* nonce,
   return m;
 }
 static void send_msg1() {
+  ++g_epoch; g_hid_seen = false; g_stream.reset(); g_video_ingress.reset_session();
   g_txpn = 1; // fresh ANonce derives a fresh key; never reset on msg4 retries
   RAND_bytes(g_anonce, 32);
   for (int i=7;i>=0;--i) if (++g_replay[i]) break;
@@ -318,21 +334,31 @@ static bool ccm(bool enc, const uint8_t* key, const uint8_t* nonce, const uint8_
 }
 
 static void send_plain(uint16_t eth, const std::vector<uint8_t>& payload) {
+  std::lock_guard<std::recursive_mutex> session(g_session_mu);
+  if (g_state != 2) return;
   std::vector<uint8_t> plain = {0xaa,0xaa,3,0,0,0,uint8_t(eth >> 8),uint8_t(eth)};
   plain.insert(plain.end(), payload.begin(), payload.end());
   auto hdr = mgmt_hdr(0x08, g_sta); hdr[1] = 0x42;
+  const uint16_t seq = uint16_t((g_data_seq++ & 4095) << 4);
+  hdr[22] = uint8_t(seq); hdr[23] = uint8_t(seq >> 8);
   std::vector<uint8_t> frame(devourer::sta::ccmp_encrypted_len(hdr.size(), plain.size()));
   if (devourer::sta::ccmp_encrypt(g_crypto, g_tk, hdr.data(), hdr.size(), g_bssid,
                                  g_txpn++, 0, plain.data(), plain.size(),
                                  frame.data(), frame.size()))
-    enqueue(std::move(frame));
+    enqueue(std::move(frame), true);
+}
+static void send_udp(uint16_t source, uint16_t dest, const std::vector<uint8_t>& data) {
+  send_plain(0x0800, wiiu::udp_packet(source, dest, data));
 }
 
 static void handle_plain(const std::vector<uint8_t>& plain) {
   auto offers = g_network.offers, acks = g_network.acks, arps = g_network.arps;
   g_network.receive(g_bssid, g_sta, plain.data(), plain.size(), send_plain,
     [](uint16_t sport, uint16_t dport, const uint8_t* hid, size_t n) {
-      if (sport == 50122 && dport == 50022) g_dsu.update(hid, n, g_sta);
+      if (sport == 50122 && dport == 50022 && n == 128) {
+        g_dsu.update(hid, n, g_sta); g_hid_seen = true;
+      }
+      if (g_enable_video) g_stream.receive(sport, dport, hid, n, send_udp);
       if (g_network.udp_packets <= 16)
         fprintf(stderr, "  GamePad UDP %u -> %u, %zu bytes\n", sport, dport, n);
     });
@@ -342,6 +368,7 @@ static void handle_plain(const std::vector<uint8_t>& plain) {
 }
 
 static void on_rx(const Packet& raw) {
+  std::lock_guard<std::recursive_mutex> session(g_session_mu);
   Packet p = raw;
   if (p.RxAtrib.fcs_present) {
     if (p.Data.size() < 4) return;
@@ -655,8 +682,12 @@ int main(int argc, char** argv) {
       fprintf(stderr, "beacon IE tail: using %zu captured bytes from %s\n", g_ie_override.size(), h); }
   }
   if (!load_identity()) return 1;
+  if (const char* v = std::getenv("DEVOURER_WIIU_VIDEO")) g_enable_video = atoi(v) != 0;
   if (!g_scan && !g_dsu.start()) {
     fprintf(stderr, "ERROR: could not bind the local DSU endpoint on port 26760\n"); return 1;
+  }
+  if (!g_scan && g_enable_video && !g_video_ingress.start()) {
+    fprintf(stderr, "ERROR: could not bind video ingress on port 26762\n"); return 1;
   }
   if (!std::getenv("DEVOURER_CHANNEL"))
     fprintf(stderr, "DEVOURER_CHANNEL unset, using %d; GamePad scans for the AP\n", g_chan);
@@ -681,6 +712,13 @@ int main(int argc, char** argv) {
   auto dev = wifi.CreateRadio(h, ctx, lk, devourer_config_from_env());
   g_dev = dev.get(); if (!g_dev) return 1;
   g_rt = devourer::build_stream_radiotap(devourer::parse_tx_mode_str("6M"));
+  if (g_enable_video) {
+    const char* rate = std::getenv("DEVOURER_WIIU_DATA_RATE");
+    const char* no_ack_env = std::getenv("DEVOURER_WIIU_NOACK");
+    const bool no_ack = !no_ack_env || strcmp(no_ack_env, "0");
+    g_data_rt = devourer::build_stream_radiotap(devourer::parse_tx_mode_str(rate ? rate : "24M"), no_ack);
+    fprintf(stderr, "Encrypted data rate: %s\n", rate ? rate : "24M");
+  }
   g_dev->InitWrite(SelectedChannel{g_chan, 0, CHANNEL_WIDTH_20});
 
   if (g_scan) {
@@ -718,12 +756,69 @@ int main(int argc, char** argv) {
   fprintf(stderr, "ap_wiiu up (beacon=%s, %d TU). %ds. Power on the GamePad.\n",
           bok ? "OK" : "FAIL", tu, sec);
 
+  #ifdef _WIN32
+  timeBeginPeriod(1);
+  #endif
+  auto clock_host = std::chrono::steady_clock::now(), next_clock = clock_host;
+  uint64_t clock_tsf = 0;
+  int64_t clock_error_us = 0;
+  auto next_stats = clock_host + std::chrono::seconds(5);
   auto end = std::chrono::steady_clock::now() + std::chrono::seconds(sec);
   while (!g_stop && std::chrono::steady_clock::now() < end) {
     g_dsu.pump();
-    std::vector<std::vector<uint8_t>> batch;
+    if (g_enable_video) {
+      const auto now = std::chrono::steady_clock::now();
+      // libusb control transfers dispatch RX callbacks. Never hold a callback's
+      // session lock across a device operation, or synchronous completion stalls.
+      if (now >= next_clock) {
+        try {
+          const uint64_t sampled = g_dev->ReadTsf();
+          const auto sampled_host = std::chrono::steady_clock::now();
+          if (clock_tsf) clock_error_us = int64_t(sampled - clock_tsf) -
+            std::chrono::duration_cast<std::chrono::microseconds>(sampled_host - clock_host).count();
+          clock_tsf = sampled; clock_host = sampled_host;
+        }
+        catch (const std::exception&) { /* keep the last good clock sample */ }
+        next_clock = now + std::chrono::milliseconds(200);
+      }
+      std::lock_guard<std::recursive_mutex> session(g_session_mu);
+      const bool ready = g_state == 2 && g_hid_seen && clock_tsf != 0;
+      wiiu::VideoFrame video;
+      bool frame_ready = g_video_ingress.pump(ready, g_stream.need_idr, g_epoch, video);
+      if (ready) {
+        const uint32_t ts = uint32_t(clock_tsf + std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - clock_host).count());
+        // libdrc timestamps a frame before encoding, then transmits it on the
+        // following 59.94-Hz tick. Match that one-frame age at transmission.
+        if (frame_ready) g_stream.video(video, ts - 16683, send_udp);
+        g_stream.pump(ts, send_udp);
+      }
+      if (now >= next_stats) {
+        fprintf(stderr, "video: ready=%d frames=%llu packets=%llu cmd_replies=%llu resyncs=%llu queue_drops=%llu clock_error_us=%lld\n",
+          ready, (unsigned long long)g_stream.frames, (unsigned long long)g_stream.video_packets,
+          (unsigned long long)g_stream.replies, (unsigned long long)g_stream.resyncs,
+          (unsigned long long)g_queue_drops.load(), (long long)clock_error_us);
+        next_stats = now + std::chrono::seconds(5);
+      }
+    }
+    std::vector<PendingFrame> batch;
     { std::lock_guard<std::mutex> l(g_q_mu); batch.swap(g_q); }
-    for (auto& f : batch) if (g_dev->send_packet(f.data(), f.size())) g_sent.fetch_add(1);
+    std::vector<TxPacketView> views;
+    for (auto& f : batch) {
+      {
+        std::lock_guard<std::recursive_mutex> session(g_session_mu);
+        if (f.encrypted && (f.epoch != g_epoch || g_state != 2)) continue;
+      }
+      views.push_back({f.bytes.data(), f.bytes.size()});
+    }
+    if (!views.empty()) {
+      const auto submitted = g_dev->send_packets(views.data(), views.size());
+      g_sent.fetch_add(submitted);
+      if (submitted != views.size() && g_enable_video) {
+        std::lock_guard<std::recursive_mutex> session(g_session_mu);
+        g_stream.need_idr = true;
+      }
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   g_dev->StopRxLoop(); rx.join();
@@ -740,6 +835,10 @@ int main(int argc, char** argv) {
                       "airing; power-cycle the adapter\n");
   }
   g_dev->Stop();
+  g_video_ingress.stop();
   g_dsu.stop();
+  #ifdef _WIN32
+  timeEndPeriod(1);
+  #endif
   std::_Exit(0);
 }
